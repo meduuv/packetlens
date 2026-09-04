@@ -1,46 +1,153 @@
 from __future__ import annotations
-import ipaddress, json, struct
+
+import ipaddress
+import json
+import struct
 from collections import Counter
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
+
+PCAP_MAGICS = {
+    b"\xd4\xc3\xb2\xa1": ("<", 1_000_000),
+    b"\xa1\xb2\xc3\xd4": (">", 1_000_000),
+    b"\x4d\x3c\xb2\xa1": ("<", 1_000_000_000),
+    b"\xa1\xb2\x3c\x4d": (">", 1_000_000_000),
+}
+
+PROTOCOL_NAMES = {
+    1: "ICMP",
+    6: "TCP",
+    17: "UDP",
+}
+
 
 @dataclass(slots=True)
 class Packet:
-    ts: float; src: str; dst: str; protocol: str; src_port: int|None; dst_port: int|None; length: int
+    timestamp: float
+    src: str
+    dst: str
+    protocol: str
+    src_port: int | None
+    dst_port: int | None
+    length: int
 
-class PcapError(ValueError): pass
 
-def _read_u16(data: bytes, off: int) -> int: return struct.unpack('!H', data[off:off+2])[0]
+class PcapError(ValueError):
+    """Raised when a capture is malformed or unsupported."""
 
-def parse_pcap(path: str|Path) -> list[Packet]:
-    raw=Path(path).read_bytes()
-    if len(raw)<24: raise PcapError('file is too small to be a PCAP')
-    magic=raw[:4]
-    fmts={b'\xd4\xc3\xb2\xa1':('<',1_000_000),b'\xa1\xb2\xc3\xd4':('>',1_000_000),b'\x4d\x3c\xb2\xa1':('<',1_000_000_000),b'\xa1\xb2\x3c\x4d':('>',1_000_000_000)}
-    if magic not in fmts: raise PcapError('unsupported PCAP magic')
-    endian,scale=fmts[magic]; network=struct.unpack(endian+'I',raw[20:24])[0]
-    if network!=1: raise PcapError('only Ethernet PCAP files are supported')
-    out=[]; off=24
-    while off+16<=len(raw):
-        sec,sub,incl,_=struct.unpack(endian+'IIII',raw[off:off+16]); off+=16
-        frame=raw[off:off+incl]; off+=incl
-        if len(frame)<14: continue
-        eth_type=_read_u16(frame,12); pos=14
-        if eth_type==0x8100 and len(frame)>=18: eth_type=_read_u16(frame,16); pos=18
-        if eth_type!=0x0800 or len(frame)<pos+20: continue
-        ihl=(frame[pos]&0x0F)*4
-        if ihl<20 or len(frame)<pos+ihl: continue
-        proto=frame[pos+9]; src=str(ipaddress.ip_address(frame[pos+12:pos+16])); dst=str(ipaddress.ip_address(frame[pos+16:pos+20]))
-        sport=dport=None; name={6:'TCP',17:'UDP',1:'ICMP'}.get(proto,f'IP/{proto}')
-        l4=pos+ihl
-        if proto in (6,17) and len(frame)>=l4+4: sport,dport=_read_u16(frame,l4),_read_u16(frame,l4+2)
-        out.append(Packet(sec+sub/scale,src,dst,name,sport,dport,len(frame)))
-    return out
+
+def _read_u16(data: bytes, offset: int) -> int:
+    return struct.unpack("!H", data[offset : offset + 2])[0]
+
+
+def _parse_ipv4(frame: bytes, position: int, timestamp: float) -> Packet | None:
+    if len(frame) < position + 20:
+        return None
+
+    version = frame[position] >> 4
+    ihl = (frame[position] & 0x0F) * 4
+    if version != 4 or ihl < 20 or len(frame) < position + ihl:
+        return None
+
+    protocol_number = frame[position + 9]
+    source = str(ipaddress.ip_address(frame[position + 12 : position + 16]))
+    destination = str(ipaddress.ip_address(frame[position + 16 : position + 20]))
+    protocol = PROTOCOL_NAMES.get(protocol_number, f"IP/{protocol_number}")
+
+    source_port = None
+    destination_port = None
+    transport_offset = position + ihl
+    if protocol_number in (6, 17) and len(frame) >= transport_offset + 4:
+        source_port = _read_u16(frame, transport_offset)
+        destination_port = _read_u16(frame, transport_offset + 2)
+
+    return Packet(
+        timestamp=timestamp,
+        src=source,
+        dst=destination,
+        protocol=protocol,
+        src_port=source_port,
+        dst_port=destination_port,
+        length=len(frame),
+    )
+
+
+def parse_pcap(path: str | Path) -> list[Packet]:
+    """Parse IPv4 packets from a classic Ethernet PCAP file."""
+    raw = Path(path).read_bytes()
+    if len(raw) < 24:
+        raise PcapError("file is too small to be a PCAP")
+
+    try:
+        endian, timestamp_scale = PCAP_MAGICS[raw[:4]]
+    except KeyError as exc:
+        raise PcapError("unsupported PCAP magic") from exc
+
+    network_type = struct.unpack(endian + "I", raw[20:24])[0]
+    if network_type != 1:
+        raise PcapError("only Ethernet PCAP files are supported")
+
+    packets: list[Packet] = []
+    offset = 24
+
+    while offset < len(raw):
+        if offset + 16 > len(raw):
+            raise PcapError("truncated packet record header")
+
+        seconds, fraction, captured_length, _ = struct.unpack(
+            endian + "IIII",
+            raw[offset : offset + 16],
+        )
+        offset += 16
+
+        end = offset + captured_length
+        if end > len(raw):
+            raise PcapError("truncated packet data")
+
+        frame = raw[offset:end]
+        offset = end
+        if len(frame) < 14:
+            continue
+
+        ether_type = _read_u16(frame, 12)
+        payload_offset = 14
+
+        if ether_type == 0x8100 and len(frame) >= 18:
+            ether_type = _read_u16(frame, 16)
+            payload_offset = 18
+
+        if ether_type != 0x0800:
+            continue
+
+        timestamp = seconds + fraction / timestamp_scale
+        packet = _parse_ipv4(frame, payload_offset, timestamp)
+        if packet is not None:
+            packets.append(packet)
+
+    return packets
+
 
 def summarize(packets: list[Packet]) -> dict:
-    protocols=Counter(p.protocol for p in packets); hosts=Counter()
-    for p in packets: hosts[p.src]+=1; hosts[p.dst]+=1
-    return {'packets':len(packets),'bytes':sum(p.length for p in packets),'protocols':dict(protocols.most_common()),'top_hosts':hosts.most_common(10)}
+    protocols = Counter(packet.protocol for packet in packets)
+    hosts = Counter()
 
-def to_json(packets:list[Packet])->str:
-    return json.dumps({'summary':summarize(packets),'packets':[asdict(p) for p in packets]},indent=2)
+    for packet in packets:
+        hosts[packet.src] += 1
+        hosts[packet.dst] += 1
+
+    return {
+        "packets": len(packets),
+        "bytes": sum(packet.length for packet in packets),
+        "protocols": dict(protocols.most_common()),
+        "top_hosts": hosts.most_common(10),
+    }
+
+
+def to_json(packets: list[Packet]) -> str:
+    return json.dumps(
+        {
+            "summary": summarize(packets),
+            "packets": [asdict(packet) for packet in packets],
+        },
+        indent=2,
+    )
